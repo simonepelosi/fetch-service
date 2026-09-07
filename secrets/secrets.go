@@ -134,8 +134,9 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
 }
 
 type Identity struct {
-	Methods  []string  `json:"methods"`
-	Password *Password `json:"password,omitempty"`
+	Methods               []string               `json:"methods"`
+	Password              *Password              `json:"password,omitempty"`
+	ApplicationCredential *ApplicationCredential `json:"application_credential,omitempty"`
 }
 
 type Password struct {
@@ -148,7 +149,18 @@ type User struct {
 	Domain   map[string]any `json:"domain"`
 }
 
-// Keystone V3 request format:
+// ApplicationCredential is the identity.application_credential object
+// of a Keystone v3 application-credential auth request. Unlike
+// password auth it carries no user/domain scope: the credential is
+// already bound to a single project when it is created.
+type ApplicationCredential struct {
+	ID     string `json:"id"`
+	Secret string `json:"secret"`
+}
+
+// Keystone V3 request formats:
+//
+// Password auth:
 //
 // {
 //   "auth": {
@@ -176,9 +188,25 @@ type User struct {
 //     }
 //   }
 // }
+//
+// Application-credential auth:
+//
+// {
+//   "auth": {
+//     "identity": {
+//       "methods": [
+//         "application_credential"
+//       ],
+//       "application_credential": {
+//         "id": "...",
+//         "secret": "..."
+//       }
+//     }
+//   }
+// }
 
 func injectKeystoneV3Secret(s Secret, r io.ReadCloser) ([]byte, error) {
-	user, pass, ok := strings.Cut(s.KeystoneV3Creds, ":")
+	id, secret, ok := strings.Cut(s.KeystoneV3Creds, ":")
 	if !ok {
 		return nil, errors.New("invalid keystone-v3 credentials format")
 	}
@@ -202,20 +230,9 @@ func injectKeystoneV3Secret(s Secret, r io.ReadCloser) ([]byte, error) {
 		return nil, fmt.Errorf("cannot unmarshal auth data: %w", err)
 	}
 
-	domain, err := getKeystoneV3IdentityDomain(auth)
+	newIdentity, err := newKeystoneV3Identity(auth, id, secret)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read keystone-v3 identity domain: %w", err)
-	}
-
-	newIdentity := map[string]any{
-		"methods": []string{"password"},
-		"password": map[string]any{
-			"user": map[string]any{
-				"name":     user,
-				"password": pass,
-				"domain":   domain,
-			},
-		},
+		return nil, fmt.Errorf("cannot build keystone-v3 identity: %w", err)
 	}
 
 	identityBytes, err := json.Marshal(newIdentity)
@@ -236,6 +253,51 @@ func injectKeystoneV3Secret(s Secret, r io.ReadCloser) ([]byte, error) {
 	}
 
 	return bodyBytes, nil
+}
+
+// newKeystoneV3Identity builds the replacement "identity" object for
+// a Keystone v3 auth request, preserving whichever auth method the
+// original request used and substituting id/secret for its
+// credentials. Application-credential auth is already project-scoped
+// by the credential itself, so it carries no domain; password auth
+// keeps the original request's user domain, since Keystone needs it
+// to resolve the user.
+func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (map[string]any, error) {
+	identityData, ok := auth["identity"]
+	if !ok {
+		return nil, errors.New("cannot find identity in keystone-v3 auth request")
+	}
+
+	var identity Identity
+	if err := json.Unmarshal(identityData, &identity); err != nil {
+		return nil, fmt.Errorf("cannot unmarshal identity data: %w", err)
+	}
+
+	if identity.ApplicationCredential != nil {
+		return map[string]any{
+			"methods": []string{"application_credential"},
+			"application_credential": map[string]any{
+				"id":     id,
+				"secret": secret,
+			},
+		}, nil
+	}
+
+	domain, err := getKeystoneV3IdentityDomain(auth)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read keystone-v3 identity domain: %w", err)
+	}
+
+	return map[string]any{
+		"methods": []string{"password"},
+		"password": map[string]any{
+			"user": map[string]any{
+				"name":     id,
+				"password": secret,
+				"domain":   domain,
+			},
+		},
+	}, nil
 }
 
 func getKeystoneV3IdentityDomain(auth map[string]json.RawMessage) (map[string]any, error) {

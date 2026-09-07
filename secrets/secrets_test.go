@@ -174,6 +174,48 @@ func (t *secretSuite) TestInjectBodySecrets(c *C) {
 	})
 }
 
+func (t *secretSuite) TestInjectBodySecretsApplicationCredential(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
+	}
+
+	body := []byte(`{
+		"auth": {
+			"identity": {
+				"methods": ["application_credential"],
+				"application_credential": { "id": "old-id", "secret": "old-secret" }
+			},
+			"extra-field": "extra-content"
+		}
+	}`)
+
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
+	c.Assert(err, IsNil)
+
+	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(injected, Equals, true)
+
+	requestBody, err := io.ReadAll(req.Body)
+	c.Assert(err, IsNil)
+
+	var bodyData map[string]any
+	err = json.Unmarshal(requestBody, &bodyData)
+	c.Assert(err, IsNil)
+
+	c.Check(bodyData, DeepEquals, map[string]any{
+		"auth": map[string]any{
+			"identity": map[string]any{
+				"methods": []any{"application_credential"},
+				"application_credential": map[string]any{
+					"id":     "new-id",
+					"secret": "new-secret",
+				},
+			},
+			"extra-field": "extra-content",
+		},
+	})
+}
+
 type getKeystoneV3IdentityDomainTest struct {
 	input  string         // The auth request
 	domain map[string]any // Expected domain output
