@@ -273,7 +273,11 @@ func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (
 		return nil, fmt.Errorf("cannot unmarshal identity data: %w", err)
 	}
 
-	if identity.ApplicationCredential != nil {
+	switch {
+	case slices.Contains(identity.Methods, "application_credential"):
+		if identity.ApplicationCredential == nil {
+			return nil, errors.New("keystone-v3 identity method is application_credential but application_credential object is missing")
+		}
 		return map[string]any{
 			"methods": []string{"application_credential"},
 			"application_credential": map[string]any{
@@ -281,23 +285,31 @@ func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (
 				"secret": secret,
 			},
 		}, nil
-	}
 
-	domain, err := getKeystoneV3IdentityDomain(auth)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read keystone-v3 identity domain: %w", err)
-	}
+	case slices.Contains(identity.Methods, "password"):
+		if identity.Password == nil || identity.Password.User == nil {
+			return nil, errors.New("keystone-v3 identity method is password but password.user object is missing")
+		}
 
-	return map[string]any{
-		"methods": []string{"password"},
-		"password": map[string]any{
-			"user": map[string]any{
-				"name":     id,
-				"password": secret,
-				"domain":   domain,
+		domain, err := getKeystoneV3IdentityDomain(auth)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read keystone-v3 identity domain: %w", err)
+		}
+
+		return map[string]any{
+			"methods": []string{"password"},
+			"password": map[string]any{
+				"user": map[string]any{
+					"name":     id,
+					"password": secret,
+					"domain":   domain,
+				},
 			},
-		},
-	}, nil
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported keystone-v3 auth methods: %v", identity.Methods)
+	}
 }
 
 func getKeystoneV3IdentityDomain(auth map[string]json.RawMessage) (map[string]any, error) {

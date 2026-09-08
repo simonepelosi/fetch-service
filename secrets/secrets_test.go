@@ -216,6 +216,79 @@ func (t *secretSuite) TestInjectBodySecretsApplicationCredential(c *C) {
 	})
 }
 
+func (t *secretSuite) TestInjectBodySecretsDispatchesOnMethodsNotFieldPresence(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-user:new-pass"},
+	}
+
+	// The methods list says "password", but a stray application_credential
+	// object is also present. Dispatch must follow methods, not field
+	// presence, so this must still be rewritten as password auth.
+	body := []byte(`{
+		"auth": {
+			"identity": {
+				"methods": ["password"],
+				"password": { "user": { "name": "old-name", "password": "old-pass", "domain": {"name": "my-domain"} } },
+				"application_credential": { "id": "stray-id", "secret": "stray-secret" }
+			}
+		}
+	}`)
+
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
+	c.Assert(err, IsNil)
+
+	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(injected, Equals, true)
+
+	requestBody, err := io.ReadAll(req.Body)
+	c.Assert(err, IsNil)
+
+	var bodyData map[string]any
+	err = json.Unmarshal(requestBody, &bodyData)
+	c.Assert(err, IsNil)
+
+	identity := bodyData["auth"].(map[string]any)["identity"].(map[string]any)
+	c.Check(identity["methods"], DeepEquals, []any{"password"})
+	c.Check(identity["password"], DeepEquals, map[string]any{
+		"user": map[string]any{
+			"name":     "new-user",
+			"password": "new-pass",
+			"domain": map[string]any{
+				"name": "my-domain",
+			},
+		},
+	})
+	_, hasApplicationCredential := identity["application_credential"]
+	c.Check(hasApplicationCredential, Equals, false)
+}
+
+func (t *secretSuite) TestInjectBodySecretsRejectsMethodWithoutMatchingObject(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
+	}
+
+	// The methods list says "application_credential", but the object is
+	// missing. This must fail rather than silently falling back to
+	// password/domain handling, leaving the original body untouched.
+	body := []byte(`{
+		"auth": {
+			"identity": {
+				"methods": ["application_credential"]
+			}
+		}
+	}`)
+
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
+	c.Assert(err, IsNil)
+
+	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(injected, Equals, true)
+
+	requestBody, err := io.ReadAll(req.Body)
+	c.Assert(err, IsNil)
+	c.Check(len(requestBody), Equals, 0)
+}
+
 type getKeystoneV3IdentityDomainTest struct {
 	input  string         // The auth request
 	domain map[string]any // Expected domain output
