@@ -125,17 +125,22 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
 		req.Body.Close()
 		if err != nil {
 			sl.Debugf("cannot read keystone-v3 request body: %s", err)
-			break
 		}
 
-		newBody, err := injectKeystoneV3Secret(s, raw)
-		if err != nil {
-			sl.Debugf("cannot inject keystone-v3 secret: %s", err)
-			// Fall back to the original body: the decoder above already
-			// drained req.Body, so it must be explicitly restored rather
-			// than left as a closed, empty reader with a stale
-			// Content-Length.
-			newBody = raw
+		// newBody defaults to whatever of the original body we actually
+		// managed to read (all of it, on the happy path; a truncated
+		// prefix if the read itself failed). It must always be kept in
+		// lockstep with Content-Length below: falling through to the
+		// reset without updating newBody would forward a closed/drained
+		// reader alongside a stale, larger Content-Length.
+		newBody := raw
+		if err == nil {
+			injected, injErr := injectKeystoneV3Secret(s, raw)
+			if injErr != nil {
+				sl.Debugf("cannot inject keystone-v3 secret: %s", injErr)
+			} else {
+				newBody = injected
+			}
 		}
 
 		req.Body = io.NopCloser(bytes.NewReader(newBody))

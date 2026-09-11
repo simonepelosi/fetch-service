@@ -3,6 +3,7 @@ package secrets_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -322,6 +323,50 @@ func (t *secretSuite) TestInjectBodySecretsFallsBackToOriginalBodyOnInjectionErr
 	c.Check(requestBody, DeepEquals, body)
 	c.Check(req.ContentLength, Equals, int64(len(body)))
 	c.Check(req.Header.Get("Content-Length"), Equals, strconv.Itoa(len(body)))
+}
+
+// failingReader returns some data, then a non-EOF error, simulating a
+// body read that fails partway through (e.g. a client disconnect).
+type failingReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (t *secretSuite) TestInjectBodySecretsKeepsContentLengthConsistentOnReadFailure(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
+	}
+
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", nil)
+	c.Assert(err, IsNil)
+
+	// Simulate a request whose body read fails partway through, after the
+	// original Content-Length was already set for the full (larger) body.
+	partial := []byte(`{"partial`)
+	req.Body = io.NopCloser(&failingReader{data: partial, err: errors.New("connection reset by peer")})
+	req.ContentLength = 999
+	req.Header.Set("Content-Length", "999")
+
+	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(injected, Equals, true)
+
+	// The body and Content-Length must describe the same thing: whatever
+	// was actually read, not the stale original length paired with a
+	// closed/drained reader.
+	requestBody, err := io.ReadAll(req.Body)
+	c.Assert(err, IsNil)
+	c.Check(requestBody, DeepEquals, partial)
+	c.Check(req.ContentLength, Equals, int64(len(partial)))
+	c.Check(req.Header.Get("Content-Length"), Equals, strconv.Itoa(len(partial)))
 }
 
 type getKeystoneV3IdentityDomainTest struct {
