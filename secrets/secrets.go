@@ -121,11 +121,23 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
 		// arbitrary sequence of bytes
 		req.Header.Set("Authorization", "macaroon "+s.MacaroonCreds)
 	case KeystoneV3Type:
-		newBody, err := injectKeystoneV3Secret(s, req.Body)
+		raw, err := io.ReadAll(req.Body)
+		req.Body.Close()
 		if err != nil {
-			sl.Debugf("cannot inject keystone-v3 secret: %s", err)
+			sl.Debugf("cannot read keystone-v3 request body: %s", err)
 			break
 		}
+
+		newBody, err := injectKeystoneV3Secret(s, raw)
+		if err != nil {
+			sl.Debugf("cannot inject keystone-v3 secret: %s", err)
+			// Fall back to the original body: the decoder above already
+			// drained req.Body, so it must be explicitly restored rather
+			// than left as a closed, empty reader with a stale
+			// Content-Length.
+			newBody = raw
+		}
+
 		req.Body = io.NopCloser(bytes.NewReader(newBody))
 		req.ContentLength = int64(len(newBody))
 		req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
@@ -205,19 +217,16 @@ type ApplicationCredential struct {
 //   }
 // }
 
-func injectKeystoneV3Secret(s Secret, r io.ReadCloser) ([]byte, error) {
+func injectKeystoneV3Secret(s Secret, raw []byte) ([]byte, error) {
 	id, secret, ok := strings.Cut(s.KeystoneV3Creds, ":")
 	if !ok {
 		return nil, errors.New("invalid keystone-v3 credentials format")
 	}
 
 	var body map[string]json.RawMessage
-	dec := json.NewDecoder(r)
-	err := dec.Decode(&body)
-	if err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, fmt.Errorf("cannot decode keystone-v3 request body: %w", err)
 	}
-	r.Close()
 
 	authData, ok := body["auth"]
 	if !ok {
@@ -225,8 +234,7 @@ func injectKeystoneV3Secret(s Secret, r io.ReadCloser) ([]byte, error) {
 	}
 
 	var auth map[string]json.RawMessage
-	err = json.Unmarshal(authData, &auth)
-	if err != nil {
+	if err := json.Unmarshal(authData, &auth); err != nil {
 		return nil, fmt.Errorf("cannot unmarshal auth data: %w", err)
 	}
 
@@ -273,8 +281,12 @@ func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (
 		return nil, fmt.Errorf("cannot unmarshal identity data: %w", err)
 	}
 
-	switch {
-	case slices.Contains(identity.Methods, "application_credential"):
+	if len(identity.Methods) != 1 {
+		return nil, fmt.Errorf("unsupported keystone-v3 auth methods %v: exactly one method is supported", identity.Methods)
+	}
+
+	switch identity.Methods[0] {
+	case "application_credential":
 		if identity.ApplicationCredential == nil {
 			return nil, errors.New("keystone-v3 identity method is application_credential but application_credential object is missing")
 		}
@@ -286,7 +298,7 @@ func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (
 			},
 		}, nil
 
-	case slices.Contains(identity.Methods, "password"):
+	case "password":
 		if identity.Password == nil || identity.Password.User == nil {
 			return nil, errors.New("keystone-v3 identity method is password but password.user object is missing")
 		}
@@ -308,7 +320,7 @@ func newKeystoneV3Identity(auth map[string]json.RawMessage, id, secret string) (
 		}, nil
 
 	default:
-		return nil, fmt.Errorf("unsupported keystone-v3 auth methods: %v", identity.Methods)
+		return nil, fmt.Errorf("unsupported keystone-v3 auth method: %q", identity.Methods[0])
 	}
 }
 
