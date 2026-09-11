@@ -101,17 +101,19 @@ func validateCredentials(sec Secret) error {
 	return nil
 }
 
-func InjectSecrets(secrets []Secret, url string, req *http.Request, sl logger.Logger) bool {
+func InjectSecrets(secrets []Secret, url string, req *http.Request, sl logger.Logger) (bool, error) {
 	for _, s := range secrets {
 		if s.URL.Match(url) {
-			injectSecret(s, req, sl)
-			return true
+			if err := injectSecret(s, req, sl); err != nil {
+				return true, err
+			}
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
+func injectSecret(s Secret, req *http.Request, sl logger.Logger) error {
 	switch s.Type {
 	case BasicAuthType:
 		cred := base64.StdEncoding.EncodeToString([]byte(s.BasicCreds))
@@ -124,23 +126,18 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
 		raw, err := io.ReadAll(req.Body)
 		req.Body.Close()
 		if err != nil {
-			sl.Debugf("cannot read keystone-v3 request body: %s", err)
+			// Only a prefix of the body was read. There is no complete
+			// request left to forward, original or rewritten, so the
+			// caller must reject this request instead of us silently
+			// forwarding truncated JSON as if it were whole.
+			return fmt.Errorf("cannot read keystone-v3 request body: %w", err)
 		}
 
-		// newBody defaults to whatever of the original body we actually
-		// managed to read (all of it, on the happy path; a truncated
-		// prefix if the read itself failed). It must always be kept in
-		// lockstep with Content-Length below: falling through to the
-		// reset without updating newBody would forward a closed/drained
-		// reader alongside a stale, larger Content-Length.
 		newBody := raw
-		if err == nil {
-			injected, injErr := injectKeystoneV3Secret(s, raw)
-			if injErr != nil {
-				sl.Debugf("cannot inject keystone-v3 secret: %s", injErr)
-			} else {
-				newBody = injected
-			}
+		if injected, injErr := injectKeystoneV3Secret(s, raw); injErr != nil {
+			sl.Debugf("cannot inject keystone-v3 secret: %s", injErr)
+		} else {
+			newBody = injected
 		}
 
 		req.Body = io.NopCloser(bytes.NewReader(newBody))
@@ -148,6 +145,7 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) {
 		req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
 		req.TransferEncoding = nil
 	}
+	return nil
 }
 
 type Identity struct {

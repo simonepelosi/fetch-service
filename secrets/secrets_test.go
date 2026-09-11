@@ -111,7 +111,8 @@ func (t *secretSuite) TestInjectHeaderSecrets(c *C) {
 		req, err := http.NewRequest("GET", tc.url, nil)
 		c.Assert(err, IsNil)
 
-		injected := secrets.InjectSecrets(sec, tc.url, req, t.sl)
+		injected, err := secrets.InjectSecrets(sec, tc.url, req, t.sl)
+		c.Assert(err, IsNil)
 		c.Assert(injected, Equals, tc.injected)
 		if injected {
 			header := req.Header.Get("Authorization")
@@ -139,7 +140,8 @@ func (t *secretSuite) TestInjectBodySecrets(c *C) {
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
 	c.Assert(err, IsNil)
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
 
 	requestBody, err := io.ReadAll(req.Body)
@@ -194,7 +196,8 @@ func (t *secretSuite) TestInjectBodySecretsApplicationCredential(c *C) {
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
 	c.Assert(err, IsNil)
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
 
 	requestBody, err := io.ReadAll(req.Body)
@@ -241,7 +244,8 @@ func (t *secretSuite) TestInjectBodySecretsRejectsAmbiguousMultiMethodIdentity(c
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
 	c.Assert(err, IsNil)
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
 
 	requestBody, err := io.ReadAll(req.Body)
@@ -270,7 +274,8 @@ func (t *secretSuite) TestInjectBodySecretsDispatchesOnMethodsNotFieldPresence(c
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
 	c.Assert(err, IsNil)
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
 
 	requestBody, err := io.ReadAll(req.Body)
@@ -315,7 +320,8 @@ func (t *secretSuite) TestInjectBodySecretsFallsBackToOriginalBodyOnInjectionErr
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(body))
 	c.Assert(err, IsNil)
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
 
 	requestBody, err := io.ReadAll(req.Body)
@@ -341,7 +347,7 @@ func (r *failingReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (t *secretSuite) TestInjectBodySecretsKeepsContentLengthConsistentOnReadFailure(c *C) {
+func (t *secretSuite) TestInjectBodySecretsPropagatesBodyReadError(c *C) {
 	sec := []secrets.Secret{
 		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
 	}
@@ -349,24 +355,16 @@ func (t *secretSuite) TestInjectBodySecretsKeepsContentLengthConsistentOnReadFai
 	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", nil)
 	c.Assert(err, IsNil)
 
-	// Simulate a request whose body read fails partway through, after the
-	// original Content-Length was already set for the full (larger) body.
-	partial := []byte(`{"partial`)
-	req.Body = io.NopCloser(&failingReader{data: partial, err: errors.New("connection reset by peer")})
-	req.ContentLength = 999
-	req.Header.Set("Content-Length", "999")
+	// Simulate a request whose body read fails partway through. Only a
+	// truncated prefix is available, so forwarding it dressed up as a
+	// complete request would send malformed JSON to Keystone in place of
+	// whatever the client actually sent. The caller must be told to
+	// reject the request instead of receiving a fabricated body.
+	req.Body = io.NopCloser(&failingReader{data: []byte(`{"partial`), err: errors.New("connection reset by peer")})
 
-	injected := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
 	c.Assert(injected, Equals, true)
-
-	// The body and Content-Length must describe the same thing: whatever
-	// was actually read, not the stale original length paired with a
-	// closed/drained reader.
-	requestBody, err := io.ReadAll(req.Body)
-	c.Assert(err, IsNil)
-	c.Check(requestBody, DeepEquals, partial)
-	c.Check(req.ContentLength, Equals, int64(len(partial)))
-	c.Check(req.Header.Get("Content-Length"), Equals, strconv.Itoa(len(partial)))
+	c.Assert(err, ErrorMatches, "cannot read keystone-v3 request body:.*")
 }
 
 type getKeystoneV3IdentityDomainTest struct {

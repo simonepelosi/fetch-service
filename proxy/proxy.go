@@ -240,7 +240,12 @@ func (p *HTTPProxy) processRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*h
 
 	sl := a.Logger()
 	sec := session.GetSessionSecrets(sid)
-	if secrets.InjectSecrets(sec, url, req, sl) {
+	injected, err := secrets.InjectSecrets(sec, url, req, sl)
+	if err != nil {
+		sl.Infof("cannot apply secrets to %s: %s", url, err)
+		return req, internalErrorResponse(req, "Cannot handle requests")
+	}
+	if injected {
 		sl.Debugf("applied secrets to %s", url)
 	}
 
