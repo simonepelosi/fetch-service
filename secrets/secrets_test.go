@@ -367,6 +367,23 @@ func (t *secretSuite) TestInjectBodySecretsPropagatesBodyReadError(c *C) {
 	c.Assert(err, ErrorMatches, "cannot read keystone-v3 request body:.*")
 }
 
+func (t *secretSuite) TestInjectBodySecretsRejectsOversizedBody(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
+	}
+
+	// A body far larger than any real Keystone v3 auth-token request
+	// must be rejected before being fully buffered in memory.
+	oversized := bytes.Repeat([]byte("x"), 2<<20)
+
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", bytes.NewReader(oversized))
+	c.Assert(err, IsNil)
+
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(injected, Equals, true)
+	c.Assert(errors.Is(err, secrets.ErrKeystoneV3BodyTooLarge), Equals, true)
+}
+
 type getKeystoneV3IdentityDomainTest struct {
 	input  string         // The auth request
 	domain map[string]any // Expected domain output

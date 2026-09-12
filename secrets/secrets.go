@@ -63,7 +63,18 @@ var (
 	ErrMissingBasicCreds      = errors.New("Invalid secret: missing credentials for 'basic-auth'")
 	ErrMissingMacaroonCreds   = errors.New("Invalid secret: missing credentials for 'macaroon'")
 	ErrMissingKeystoneV3Creds = errors.New("Invalid secret: missing credentials for 'keystone-v3'")
+
+	// ErrKeystoneV3BodyTooLarge is returned by InjectSecrets when a
+	// keystone-v3 auth request body exceeds maxKeystoneV3BodySize.
+	ErrKeystoneV3BodyTooLarge = errors.New("keystone-v3 request body exceeds maximum size")
 )
+
+// maxKeystoneV3BodySize bounds how much of a keystone-v3 request body
+// injectSecret will buffer in memory. Real Keystone v3 auth-token
+// requests (identity plus scope) are a few KB at most; this is
+// generous headroom while preventing a large or chunked
+// client-controlled body from being fully buffered in memory.
+const maxKeystoneV3BodySize = 1 << 20 // 1 MiB
 
 func ValidateSecrets(sec []Secret) error {
 	for _, s := range sec {
@@ -123,7 +134,7 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) error {
 		// arbitrary sequence of bytes
 		req.Header.Set("Authorization", "macaroon "+s.MacaroonCreds)
 	case KeystoneV3Type:
-		raw, err := io.ReadAll(req.Body)
+		raw, err := io.ReadAll(io.LimitReader(req.Body, maxKeystoneV3BodySize+1))
 		req.Body.Close()
 		if err != nil {
 			// Only a prefix of the body was read. There is no complete
@@ -131,6 +142,9 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) error {
 			// caller must reject this request instead of us silently
 			// forwarding truncated JSON as if it were whole.
 			return fmt.Errorf("cannot read keystone-v3 request body: %w", err)
+		}
+		if len(raw) > maxKeystoneV3BodySize {
+			return fmt.Errorf("%w: got at least %d bytes", ErrKeystoneV3BodyTooLarge, len(raw))
 		}
 
 		newBody := raw
