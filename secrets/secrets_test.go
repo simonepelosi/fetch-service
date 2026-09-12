@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 	"testing"
 
 	"github.com/canonical/fetch-service/glob"
@@ -230,7 +229,7 @@ func (t *secretSuite) TestInjectBodySecretsRejectsAmbiguousMultiMethodIdentity(c
 	// only has one credential pair to substitute, so picking either method
 	// and dropping the other would silently change the auth request's
 	// meaning (e.g. downgrading a multi-factor requirement). This must be
-	// rejected instead, leaving the original body untouched.
+	// rejected instead of forwarding either interpretation.
 	body := []byte(`{
 		"auth": {
 			"identity": {
@@ -245,12 +244,8 @@ func (t *secretSuite) TestInjectBodySecretsRejectsAmbiguousMultiMethodIdentity(c
 	c.Assert(err, IsNil)
 
 	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
-	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
-
-	requestBody, err := io.ReadAll(req.Body)
-	c.Assert(err, IsNil)
-	c.Check(requestBody, DeepEquals, body)
+	c.Assert(err, ErrorMatches, ".*exactly one method is supported.*")
 }
 
 func (t *secretSuite) TestInjectBodySecretsDispatchesOnMethodsNotFieldPresence(c *C) {
@@ -300,15 +295,15 @@ func (t *secretSuite) TestInjectBodySecretsDispatchesOnMethodsNotFieldPresence(c
 	c.Check(hasApplicationCredential, Equals, false)
 }
 
-func (t *secretSuite) TestInjectBodySecretsFallsBackToOriginalBodyOnInjectionError(c *C) {
+func (t *secretSuite) TestInjectBodySecretsRejectsMethodWithoutMatchingObject(c *C) {
 	sec := []secrets.Secret{
 		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
 	}
 
 	// The methods list says "application_credential", but the object is
-	// missing. This must fail rather than silently falling back to
-	// password/domain handling, and the original request body/Content-Length
-	// must be forwarded intact rather than left drained by the decoder.
+	// missing. Forwarding the caller's original, unsubstituted body here
+	// would be exactly the silent-failure this feature exists to fix, so
+	// the request must be rejected instead.
 	body := []byte(`{
 		"auth": {
 			"identity": {
@@ -321,14 +316,8 @@ func (t *secretSuite) TestInjectBodySecretsFallsBackToOriginalBodyOnInjectionErr
 	c.Assert(err, IsNil)
 
 	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
-	c.Assert(err, IsNil)
 	c.Assert(injected, Equals, true)
-
-	requestBody, err := io.ReadAll(req.Body)
-	c.Assert(err, IsNil)
-	c.Check(requestBody, DeepEquals, body)
-	c.Check(req.ContentLength, Equals, int64(len(body)))
-	c.Check(req.Header.Get("Content-Length"), Equals, strconv.Itoa(len(body)))
+	c.Assert(err, ErrorMatches, ".*application_credential object is missing.*")
 }
 
 // failingReader returns some data, then a non-EOF error, simulating a
@@ -382,6 +371,23 @@ func (t *secretSuite) TestInjectBodySecretsRejectsOversizedBody(c *C) {
 	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
 	c.Assert(injected, Equals, true)
 	c.Assert(errors.Is(err, secrets.ErrKeystoneV3BodyTooLarge), Equals, true)
+}
+
+func (t *secretSuite) TestInjectBodySecretsNilBodyIsNoOp(c *C) {
+	sec := []secrets.Secret{
+		{Type: secrets.KeystoneV3Type, URL: glob.MustCompile("https://my-domain.com:5000/v3/auth/tokens"), KeystoneV3Creds: "new-id:new-secret"},
+	}
+
+	// A bodyless request (e.g. GET, or any manually constructed request
+	// with a nil Body) matching the secret's URL rule must not panic.
+	req, err := http.NewRequest("GET", "https://my-domain.com:5000/v3/auth/tokens", nil)
+	c.Assert(err, IsNil)
+	c.Assert(req.Body, IsNil)
+
+	injected, err := secrets.InjectSecrets(sec, "https://my-domain.com:5000/v3/auth/tokens", req, t.sl)
+	c.Assert(err, IsNil)
+	c.Assert(injected, Equals, true)
+	c.Check(req.Body, IsNil)
 }
 
 type getKeystoneV3IdentityDomainTest struct {

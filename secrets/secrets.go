@@ -134,6 +134,13 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) error {
 		// arbitrary sequence of bytes
 		req.Header.Set("Authorization", "macaroon "+s.MacaroonCreds)
 	case KeystoneV3Type:
+		if req.Body == nil {
+			// Nothing to inject into (e.g. a bodyless GET matched the
+			// secret's URL rule); leave the request untouched rather
+			// than dereferencing a nil body.
+			return nil
+		}
+
 		raw, err := io.ReadAll(io.LimitReader(req.Body, maxKeystoneV3BodySize+1))
 		req.Body.Close()
 		if err != nil {
@@ -147,11 +154,13 @@ func injectSecret(s Secret, req *http.Request, sl logger.Logger) error {
 			return fmt.Errorf("%w: got at least %d bytes", ErrKeystoneV3BodyTooLarge, len(raw))
 		}
 
-		newBody := raw
-		if injected, injErr := injectKeystoneV3Secret(s, raw); injErr != nil {
-			sl.Debugf("cannot inject keystone-v3 secret: %s", injErr)
-		} else {
-			newBody = injected
+		newBody, err := injectKeystoneV3Secret(s, raw)
+		if err != nil {
+			// Forwarding raw here would silently send the caller's own,
+			// unsubstituted credentials upstream instead of the injected
+			// secret - exactly the untraceable failure this whole
+			// feature exists to fix. Reject the request instead.
+			return fmt.Errorf("cannot inject keystone-v3 secret: %w", err)
 		}
 
 		req.Body = io.NopCloser(bytes.NewReader(newBody))
